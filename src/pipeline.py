@@ -16,6 +16,8 @@ from .data import load_dataset, temporal_split
 ROOT = Path(__file__).resolve().parents[1]
 ART = ROOT / "artifacts"
 BASE_FEATURES = [f"V{i}" for i in range(1,29)] + ["Amount"]
+FN_COST = 5
+FP_COST = 1
 
 
 def metrics(y, score, threshold):
@@ -31,19 +33,45 @@ def metrics(y, score, threshold):
         "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
         "false_positive_rate": float(fp / (fp + tn)),
         "false_negative_rate": float(fn / (fn + tp)) if fn + tp else 0.0,
+        "illustrative_cost": int(FN_COST * fn + FP_COST * fp),
     }
 
 
 def choose_threshold(y, score):
-    candidates = np.unique(np.quantile(score, np.linspace(0.90, 0.9999, 250)))
-    best = None
-    for t in candidates:
-        m = metrics(y, score, t)
-        cost = 5*m["fn"] + m["fp"]
-        key = (cost, -m["recall"], -m["precision"])
-        if best is None or key < best[0]:
-            best = (key, m)
-    return best[1]
+    """Find the exact validation threshold minimizing the declared FP/FN cost.
+
+    Scores are sorted once. We evaluate every distinct score boundary, avoiding
+    a coarse quantile grid that could miss the true minimum-cost threshold.
+    """
+    y = np.asarray(y, dtype=int)
+    score = np.asarray(score, dtype=float)
+    order = np.argsort(-score, kind="stable")
+    ys = y[order]
+    ss = score[order]
+
+    total_pos = int(ys.sum())
+    total_neg = int(len(ys) - total_pos)
+    tp_cum = np.cumsum(ys)
+    fp_cum = np.cumsum(1 - ys)
+
+    # Only positions at the end of a group of tied scores represent unique thresholds.
+    ends = np.r_[np.flatnonzero(ss[:-1] != ss[1:]), len(ss) - 1]
+    best_key = None
+    best_threshold = None
+    for idx in ends:
+        tp = int(tp_cum[idx])
+        fp = int(fp_cum[idx])
+        fn = total_pos - tp
+        tn = total_neg - fp
+        cost = FN_COST * fn + FP_COST * fp
+        recall = tp / total_pos if total_pos else 0.0
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        key = (cost, -recall, -precision, fp)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_threshold = float(ss[idx])
+
+    return metrics(y, score, best_threshold)
 
 
 def build_models():
@@ -69,8 +97,10 @@ def main():
     Xt, yt = test[features], test["Class"].to_numpy()
 
     val_rows = []
+    fitted = {}
     for name, model in build_models().items():
         model.fit(Xtr, ytr)
+        fitted[name] = model
         s = score_model(model, Xv)
         m = choose_threshold(yv, s)
         m["model"] = name
@@ -78,6 +108,7 @@ def main():
 
     iso = IsolationForest(n_estimators=250, contamination=float(ytr.mean()), random_state=42, n_jobs=-1)
     iso.fit(Xtr[ytr == 0])
+    fitted["isolation_forest"] = iso
     iso_score = -iso.decision_function(Xv)
     iso_m = choose_threshold(yv, iso_score)
     iso_m["model"] = "isolation_forest"
@@ -87,14 +118,14 @@ def main():
     selected = str(val_df.sort_values(["pr_auc", "recall"], ascending=False).iloc[0]["model"])
     selected_threshold = float(val_df.loc[val_df["model"] == selected, "threshold"].iloc[0])
 
-    train_val = pd.concat([train, val], ignore_index=True)
+    # Important: the threshold was tuned for the score distribution of the model
+    # fitted on TRAIN. Re-fitting on train+validation would change that score scale
+    # while reusing the old threshold. We therefore lock both model and threshold
+    # after validation and evaluate that exact pair once on untouched TEST.
+    final_model = fitted[selected]
     if selected == "isolation_forest":
-        final_model = IsolationForest(n_estimators=250, contamination=float(train_val["Class"].mean()), random_state=42, n_jobs=-1)
-        final_model.fit(train_val.loc[train_val["Class"] == 0, features])
         test_score = -final_model.decision_function(Xt)
     else:
-        final_model = build_models()[selected]
-        final_model.fit(train_val[features], train_val["Class"])
         test_score = score_model(final_model, Xt)
 
     test_result = metrics(yt, test_score, selected_threshold)
@@ -107,7 +138,8 @@ def main():
         "data_audit": audit,
         "split": split,
         "features_used": features,
-        "selection_policy": "highest validation PR-AUC; recall tie-break; threshold tuned on validation cost = 5*FN + FP",
+        "selection_policy": "highest validation PR-AUC; recall tie-break; exact validation threshold minimizing illustrative cost = 5*FN + FP",
+        "deployment_lock_policy": "selected train-fitted model and its validation-tuned threshold are locked together before untouched test evaluation",
         "candidate_models": ["logistic", "random_forest", "hist_gradient_boosting", "isolation_forest"],
         "validation_results": val_df.to_dict(orient="records"),
         "selected_model": selected,
