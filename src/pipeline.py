@@ -15,7 +15,7 @@ from .data import load_dataset, temporal_split
 
 ROOT = Path(__file__).resolve().parents[1]
 ART = ROOT / "artifacts"
-FEATURES = ["Time"] + [f"V{i}" for i in range(1,29)] + ["Amount"]
+BASE_FEATURES = [f"V{i}" for i in range(1,29)] + ["Amount"]
 
 
 def metrics(y, score, threshold):
@@ -39,7 +39,6 @@ def choose_threshold(y, score):
     best = None
     for t in candidates:
         m = metrics(y, score, t)
-        # Fraud misses are treated as five times as costly as false alerts.
         cost = 5*m["fn"] + m["fp"]
         key = (cost, -m["recall"], -m["precision"])
         if best is None or key < best[0]:
@@ -63,21 +62,20 @@ def main():
     ART.mkdir(exist_ok=True)
     df, audit = load_dataset()
     train, val, test, split = temporal_split(df)
-    Xtr, ytr = train[FEATURES], train["Class"].to_numpy()
-    Xv, yv = val[FEATURES], val["Class"].to_numpy()
-    Xt, yt = test[FEATURES], test["Class"].to_numpy()
+
+    features = (["Time"] if "Time" in df.columns else []) + BASE_FEATURES
+    Xtr, ytr = train[features], train["Class"].to_numpy()
+    Xv, yv = val[features], val["Class"].to_numpy()
+    Xt, yt = test[features], test["Class"].to_numpy()
 
     val_rows = []
-    fitted = {}
     for name, model in build_models().items():
         model.fit(Xtr, ytr)
-        fitted[name] = model
         s = score_model(model, Xv)
         m = choose_threshold(yv, s)
         m["model"] = name
         val_rows.append(m)
 
-    # Unsupervised anomaly detector trained only on legitimate training transactions.
     iso = IsolationForest(n_estimators=250, contamination=float(ytr.mean()), random_state=42, n_jobs=-1)
     iso.fit(Xtr[ytr == 0])
     iso_score = -iso.decision_function(Xv)
@@ -89,26 +87,26 @@ def main():
     selected = str(val_df.sort_values(["pr_auc", "recall"], ascending=False).iloc[0]["model"])
     selected_threshold = float(val_df.loc[val_df["model"] == selected, "threshold"].iloc[0])
 
+    train_val = pd.concat([train, val], ignore_index=True)
     if selected == "isolation_forest":
-        train_val = pd.concat([train, val], ignore_index=True)
         final_model = IsolationForest(n_estimators=250, contamination=float(train_val["Class"].mean()), random_state=42, n_jobs=-1)
-        final_model.fit(train_val.loc[train_val["Class"] == 0, FEATURES])
+        final_model.fit(train_val.loc[train_val["Class"] == 0, features])
         test_score = -final_model.decision_function(Xt)
     else:
-        train_val = pd.concat([train, val], ignore_index=True)
         final_model = build_models()[selected]
-        final_model.fit(train_val[FEATURES], train_val["Class"])
+        final_model.fit(train_val[features], train_val["Class"])
         test_score = score_model(final_model, Xt)
 
     test_result = metrics(yt, test_score, selected_threshold)
     test_result["model"] = selected
 
-    joblib.dump({"model": final_model, "threshold": selected_threshold, "features": FEATURES}, ART / "model.joblib")
+    joblib.dump({"model": final_model, "threshold": selected_threshold, "features": features}, ART / "model.joblib")
     val_df.to_csv(ART / "validation_metrics.csv", index=False)
     pd.DataFrame([test_result]).to_csv(ART / "test_metrics.csv", index=False)
     report = {
         "data_audit": audit,
         "split": split,
+        "features_used": features,
         "selection_policy": "highest validation PR-AUC; recall tie-break; threshold tuned on validation cost = 5*FN + FP",
         "candidate_models": ["logistic", "random_forest", "hist_gradient_boosting", "isolation_forest"],
         "validation_results": val_df.to_dict(orient="records"),
