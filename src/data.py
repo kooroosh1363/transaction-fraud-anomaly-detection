@@ -9,6 +9,17 @@ DATA_DIR = ROOT / "data" / "raw"
 CACHE = DATA_DIR / "creditcard.csv"
 EXPECTED_ROWS = 284_807
 EXPECTED_FRAUD = 492
+EXPECTED_COLUMNS = ["Time", *[f"V{i}" for i in range(1, 29)], "Amount", "Class"]
+
+
+def _normalize_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize OpenML column-name casing without weakening schema validation."""
+    by_lower = {str(c).lower(): c for c in df.columns}
+    missing = [c for c in EXPECTED_COLUMNS if c.lower() not in by_lower]
+    if missing:
+        raise ValueError(f"Unexpected credit-card fraud schema; missing columns: {missing}")
+    rename = {by_lower[c.lower()]: c for c in EXPECTED_COLUMNS}
+    return df.rename(columns=rename)[EXPECTED_COLUMNS].copy()
 
 
 def load_dataset() -> tuple[pd.DataFrame, dict]:
@@ -18,20 +29,18 @@ def load_dataset() -> tuple[pd.DataFrame, dict]:
     else:
         bunch = fetch_openml(name="creditcard", version=1, as_frame=True, parser="auto")
         df = bunch.frame.copy()
-        df.to_csv(CACHE, index=False)
 
     if len(df) != EXPECTED_ROWS:
         raise ValueError(f"Unexpected row count: {len(df)}")
-    if "Class" not in df.columns:
-        raise ValueError("Target column Class is missing")
 
+    df = _normalize_schema(df)
     df["Class"] = pd.to_numeric(df["Class"], errors="raise").astype(int)
     if int(df["Class"].sum()) != EXPECTED_FRAUD:
         raise ValueError("Unexpected fraud count")
 
-    required = {"Time", "Amount", "Class"} | {f"V{i}" for i in range(1, 29)}
-    if not required.issubset(df.columns):
-        raise ValueError("Unexpected credit-card fraud schema")
+    # Cache only after the source passes row-count, target-count, and schema checks.
+    if not CACHE.exists():
+        df.to_csv(CACHE, index=False)
 
     df = df.sort_values("Time", kind="stable").reset_index(drop=True)
     audit = {
